@@ -1,0 +1,346 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  sam-process-queues
+
+  Sample SAM Template for sam-process-queues
+
+Parameters:
+  SubnetId01:
+    Type: String
+    Description: Subnet Id 01 for containers
+  SubnetId02:
+    Type: String
+    Description: Subnet Id 02 for containers
+  SecurityGroupId:
+    Type: String
+    Description: Security Group Id for containers
+
+Resources:
+
+  MySNSTopic:
+    Type: AWS::SNS::Topic
+    
+  SqsQueue:
+    Type: AWS::SQS::Queue
+  
+  TriggerContainerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: code/trigger_container/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Tracing: Active
+      Environment:
+        Variables:
+          CLUSTER_NAME: !Sub '${AWS::StackName}-cluster'
+          TASK_ROLE_ARN: !GetAtt TaskRole.Arn
+          TASK_DEFINITION: !Ref ContainerDefinition
+          SUBNET_ID_01: !Ref SubnetId01
+          SUBNET_ID_02: !Ref SubnetId02
+          SECURITY_GROUP_ID: !Ref SecurityGroupId
+          QUEUE_URL: !GetAtt SqsQueue.QueueUrl
+      Timeout: 30
+      MemorySize: 1024
+      Policies:
+        - AWSLambdaExecute
+        - Version: '2012-10-17' 
+          Statement:
+            - Effect: Allow
+              Action:
+                - ecs:*
+                - iam:PassRole
+              Resource: '*'
+                    
+  # CLOUDWATCH LOG GROUP
+
+  ECRCloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ecs/${AWS::StackName}'
+      RetentionInDays: 365
+
+
+  # CLUSTER FOR CONTAINERS
+
+  ECSCluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-cluster'
+      CapacityProviders:
+        - FARGATE
+#        - FARGATE_SPOT
+#      DefaultCapacityProviderStrategy:
+#        - CapacityProvider: FARGATE
+#          Weight: 1
+#        - CapacityProvider: FARGATE_SPOT
+#          Weight: 1
+
+  TaskExecutionRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - ecs-tasks.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Path: /
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # CONTAINER FOR LOAD FILE
+          
+  MyRepository: 
+    Type: AWS::ECR::Repository
+    Properties: 
+      RepositoryName: !Sub '${AWS::StackName}-ibm-mq-reader'
+      ImageScanningConfiguration: 
+        ScanOnPush: "true"
+        
+  TaskRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - ecs-tasks.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Path: /
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        Policies:
+          - PolicyName: AccessSNS
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - sqs:*
+                  Resource: '*'
+                  
+  ContainerDefinition: 
+    Type: AWS::ECS::TaskDefinition
+    Properties: 
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      NetworkMode: 'awsvpc'
+      Cpu: 4096
+      Memory: 16384
+      RequiresCompatibilities:
+        - "FARGATE"
+      ContainerDefinitions: 
+        - 
+          Name: "container"
+          Image: !GetAtt MyRepository.RepositoryUri
+          Cpu: 1024
+          Memory: 2048
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECRCloudWatchLogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: !Sub '${AWS::StackName}-ibm-mq-reader'
+
+            
+            
+  MyBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-records'
+            
+  FirehoseCloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${AWS::StackName}'
+      RetentionInDays: 365
+      
+      
+  FirehoseRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - firehose.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Path: /
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        Policies:
+          - PolicyName: Glue
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - glue:GetTable
+                    - glue:GetTableVersion
+                    - glue:GetTableVersions
+                    - glue:GetSchemaByDefinition
+                    - glue:GetSchemaVersion
+                  Resource: '*'
+          - PolicyName: S3
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:AbortMultipartUpload
+                    - s3:GetBucketLocation
+                    - s3:GetObject
+                    - s3:ListBucket
+                    - s3:ListBucketMultipartUploads
+                    - s3:PutObject
+                  Resource: '*'
+          - PolicyName: Lambda
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - lambda:InvokeFunction
+                    - lambda:GetFunctionConfiguration
+                  Resource: '*'
+          - PolicyName: KMS
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - kms:GenerateDataKey
+                    - kms:Decrypt
+                  Resource: '*'
+          - PolicyName: Logs
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:PutLogEvents
+                  Resource: '*'
+          - PolicyName: Kinesis
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - kinesis:DescribeStream
+                    - kinesis:GetShardIterator
+                    - kinesis:GetRecords
+                    - kinesis:ListShards
+                  Resource: '*'
+                  
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt MyBucket.Arn
+        BufferingHints:
+          IntervalInSeconds: 300
+          SizeInMBs: 128
+#        ErrorOutputPrefix: "errors/json/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/!{firehose:error-output-type}"
+#        Prefix: "data/json/year=!{partitionKeyFromQuery:year}/month=!{partitionKeyFromQuery:month}/day=!{partitionKeyFromQuery:day}/hour=!{partitionKeyFromQuery:hour}/"
+        RoleARN: !GetAtt FirehoseRole.Arn
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub '/aws/kinesisfirehose/${AWS::StackName}'
+          LogStreamName: S3Delivery
+#        DynamicPartitioningConfiguration:
+#          Enabled: true
+#          RetryOptions:
+#            DurationInSeconds: 300
+#        ProcessingConfiguration:
+#          Enabled: true
+#          Processors:
+#            - Type: MetadataExtraction
+#              Parameters:
+#                - ParameterName: MetadataExtractionQuery
+#                  ParameterValue: "{year:.requestEpoch | strftime(\"%Y\"),month:.requestEpoch | strftime(\"%m\"),day:.requestEpoch | strftime(\"%d\"),hour:.requestEpoch | strftime(\"%H\")}"
+#                - ParameterName: JsonParsingEngine
+#                  ParameterValue: "JQ-1.6"
+
+  SendSQSMessagesFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      CodeUri: code/send_sqs_firehose_messages/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Policies:
+        - SQSPollerPolicy:
+            QueueName:
+              !GetAtt SqsQueue.QueueName
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+                - firehose:PutRecord
+                - firehose:PutRecordBatch
+              Resource: '*'
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref MySNSTopic
+          DELIVERY_STREAM_NAME: !Ref DeliveryStream
+      Events:
+        MySQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SqsQueue.Arn
+            BatchSize: 5
+
+
+#  SNSSubscriptionRole:
+#      Type: 'AWS::IAM::Role'
+#      Properties:
+#        AssumeRolePolicyDocument:
+#          Version: '2012-10-17'
+#          Statement:
+#            - Effect: Allow
+#              Principal:
+#                Service:
+#                  - sns.amazonaws.com
+#              Action:
+#                - 'sts:AssumeRole'
+#        Path: /
+#        Policies:
+#          - PolicyName: Firehose
+#            PolicyDocument:
+#              Version: 2012-10-17
+#              Statement:
+#                - Effect: Allow
+#                  Action:
+#                    - firehose:DescribeDeliveryStream
+#                    - firehose:ListDeliveryStreams
+#                    - firehose:ListTagsForDeliveryStream
+#                    - firehose:PutRecord
+#                    - firehose:PutRecordBatch
+#                  Resource: '*'
+
+
+#  MySubscription:
+#    Type: AWS::SNS::Subscription
+#    Properties:
+#      Endpoint: !GetAtt DeliveryStream.Arn
+#      Protocol: firehose
+#      TopicArn: !Ref MySNSTopic
+#      SubscriptionRoleArn: !GetAtt SNSSubscriptionRole.Arn
+      
+
+Outputs:
+  S3FilesBucket:
+    Description: "Lambda Function"
+    Value: GetAtt TriggerContainerFunction.Arn
